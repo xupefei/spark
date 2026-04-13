@@ -517,6 +517,100 @@ case class WriteDelta(
   }
 }
 
+/**
+ * A logical plan for MERGE operations that support aggregate filtering for row-level operations.
+ *
+ * This plan separates aggregate filtering into explicit expressions, making the nested filter
+ * approach more readable and avoiding dependency on subquery reuse for performance.
+ *
+ * @param table the target table for the write operation
+ * @param condition the merge condition used to determine matched rows
+ * @param query the query plan that produces new data to be written
+ * @param originalTable a plan for the original table for which the row-level command was triggered
+ * @param projections projections for row ID, row, metadata attributes
+ * @param matchedRowsAgg aggregate filter for matched rows (produces __is_matched and __is_changed)
+ * @param notMatchedBySourceAgg optional aggregate filter for not matched by source rows
+ * @param write a logical write, if already constructed
+ */
+case class WriteMergeDelta(
+    table: NamedRelation,
+    condition: Expression,
+    query: LogicalPlan,
+    originalTable: NamedRelation,
+    projections: WriteDeltaProjections,
+    matchedRowsAgg: Expression,
+    notMatchedBySourceAgg: Option[Expression] = None,
+    write: Option[DeltaWrite] = None) extends RowLevelWrite {
+
+  override val isByName: Boolean = false
+  override val withSchemaEvolution: Boolean = false
+  override def writePrivileges: Set[TableWritePrivilege] =
+    throw SparkException.internalError("WriteMergeDelta.writePrivileges should not be called.")
+
+  override val stringArgs: Iterator[Any] =
+    Iterator(table, query, matchedRowsAgg, notMatchedBySourceAgg, write)
+
+  override lazy val references: AttributeSet = query.outputSet
+
+  lazy val operation: SupportsDelta = {
+    EliminateSubqueryAliases(table) match {
+      case ExtractV2Table(RowLevelOperationTable(_, operation)) =>
+        operation.asInstanceOf[SupportsDelta]
+      case _ =>
+        throw new AnalysisException(
+          errorClass = "_LEGACY_ERROR_TEMP_3057",
+          messageParameters = Map("table" -> table.toString))
+    }
+  }
+
+  override def outputResolved: Boolean = {
+    assert(table.resolved && query.resolved,
+      "`outputResolved` can only be called when `table` and `query` are both resolved.")
+    operationResolved && rowAttrsResolved && rowIdAttrsResolved && metadataAttrsResolved
+  }
+
+  // validates row projection output is compatible with table attributes
+  private def rowAttrsResolved: Boolean = {
+    val outRowAttrs = table.output
+    val inRowAttrs = projections.rowProjection match {
+      case Some(projection) => DataTypeUtils.toAttributes(projection.schema)
+      case None => Nil
+    }
+    table.skipSchemaResolution || areCompatible(inRowAttrs, outRowAttrs)
+  }
+
+  // validates row ID projection output is compatible with row ID attributes
+  private def rowIdAttrsResolved: Boolean = {
+    val outRowIdAttrs = V2ExpressionUtils.resolveRefs[AttributeReference](
+      operation.rowId.toImmutableArraySeq,
+      originalTable)
+    val inRowIdAttrs = DataTypeUtils.toAttributes(projections.rowIdProjection.schema)
+    areCompatible(inRowIdAttrs, outRowIdAttrs)
+  }
+
+  // validates metadata projection output is compatible with metadata attributes
+  private def metadataAttrsResolved: Boolean = {
+    val outMetadataAttrs = projectedMetadataAttrs.map { attr =>
+      attr.withNullability(true) // metadata nullability is not preserved in MERGE operations
+    }
+    val inMetadataAttrs = projections.metadataProjection match {
+      case Some(projection) => DataTypeUtils.toAttributes(projection.schema)
+      case None => Nil
+    }
+    areCompatible(inMetadataAttrs, outMetadataAttrs)
+  }
+
+  override def withNewQuery(newQuery: LogicalPlan): V2WriteCommand = copy(query = newQuery)
+
+  override def withNewTable(newTable: NamedRelation): V2WriteCommand = copy(table = newTable)
+
+  override def storeAnalyzedQuery(): Command = this
+
+  override protected def withNewChildInternal(newChild: LogicalPlan): WriteMergeDelta = {
+    copy(query = newChild)
+  }
+}
+
 trait V2CreateTableAsSelectPlan
   extends V2CreateTablePlan
     with AnalysisOnlyCommand

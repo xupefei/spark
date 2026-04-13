@@ -941,6 +941,8 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
         execution.SerializeFromObjectExec(serializer, planLater(child)) :: Nil
       case logical.MapPartitions(f, objAttr, child) =>
         execution.MapPartitionsExec(f, objAttr, planLater(child)) :: Nil
+      case logical.MapPartitionsInternal(f, outputAttrs, child) =>
+        execution.MapPartitionsInternalExec(f, outputAttrs, planLater(child)) :: Nil
       case logical.MapPartitionsInR(f, p, b, is, os, objAttr, child) =>
         execution.MapPartitionsExec(
           execution.r.MapPartitionsRWrapper(f, p, b, is, os), objAttr, planLater(child)) :: Nil

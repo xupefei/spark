@@ -2394,6 +2394,11 @@ class Analyzer(
         case a: FunctionTableSubqueryArgumentExpression if !a.plan.resolved =>
           resolveSubQuery(a, outer)(
             (plan, outerAttrs) => a.copy(plan = plan, outerAttrs = outerAttrs))
+        case rf @ AggregateFilter(aggregatePlan, exprId) if !aggregatePlan.resolved =>
+          val newPlan = AnalysisContext.withOuterPlan(outer) {
+            executeSameContext(aggregatePlan)
+          }
+          rf.copy(plan = newPlan)
       }
     }
 

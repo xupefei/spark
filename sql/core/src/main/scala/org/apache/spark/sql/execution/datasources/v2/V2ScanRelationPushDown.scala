@@ -27,7 +27,8 @@ import org.apache.spark.sql.catalyst.expressions.{aggregate, Alias, And, Attribu
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.optimizer.CollapseProject
 import org.apache.spark.sql.catalyst.planning.{PhysicalOperation, ScanOperation}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LeafNode, Limit, LimitAndOffset, LocalLimit, LogicalPlan, Offset, OffsetAndLimit, Project, Sample, Sort}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LeafNode, Limit, LimitAndOffset, LocalLimit, LogicalPlan, Offset, OffsetAndLimit, Project, Sample, Sort, WriteDelta}
+import org.apache.spark.sql.connector.write.{RequiresAggregateFiltering, RowLevelOperationTable}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.connector.expressions.{SortOrder => V2SortOrder}
@@ -49,6 +50,7 @@ object V2ScanRelationPushDown extends Rule[LogicalPlan] with PredicateHelper {
       createScanBuilder,
       pushDownSample,
       pushDownFilters,
+      pushDownWriteDeltaFilters,
       pushDownJoin,
       pushDownAggregates,
       pushDownVariants,
@@ -324,6 +326,50 @@ object V2ScanRelationPushDown extends Rule[LogicalPlan] with PredicateHelper {
     ).asInstanceOf[Seq[AttributeReference]]
 
     normalizedProjections.map(_.name).toArray
+  }
+
+  private def pushDownWriteDeltaFilters(plan: LogicalPlan): LogicalPlan = plan.transform {
+    case wd: WriteDelta if wd.operation.isInstanceOf[RequiresAggregateFiltering] =>
+      val filters = splitConjunctivePredicates(wd.condition)
+      val filtersWithoutSubquery = filters.filterNot(SubqueryExpression.hasSubquery)
+      if (filtersWithoutSubquery.nonEmpty) {
+        val newQuery = pushWriteDeltaFilters(wd.query, filtersWithoutSubquery)
+        wd.copy(query = newQuery)
+      } else {
+        wd
+      }
+  }
+
+  private def pushWriteDeltaFilters(plan: LogicalPlan, filters: Seq[Expression]): LogicalPlan = {
+    plan.transform {
+      case h: ScanBuilderHolder if h.relation.table.isInstanceOf[RowLevelOperationTable] =>
+        // normalize and push down the filters
+        val normalizedFilters = DataSourceStrategy.normalizeExprs(filters, h.relation.output)
+        val (pushedFilters, postScanFilters) = PushDownUtils.pushFilters(
+          h.builder,
+          normalizedFilters)
+
+        // update pushed predicates tracking
+        val pushedFiltersStr = if (pushedFilters.isLeft) {
+          pushedFilters.swap
+            .getOrElse(throw new NoSuchElementException("The left node doesn't have pushedFilters"))
+            .mkString(", ")
+        } else {
+          val newPredicates = pushedFilters.getOrElse(
+            throw new NoSuchElementException("The right node doesn't have pushedFilters"))
+          h.pushedPredicates = h.pushedPredicates ++ newPredicates
+          h.pushedPredicates.mkString(", ")
+        }
+
+        logInfo(
+          log"""
+            |Pushing row-level operation condition to ${MDC(RELATION_NAME, h.relation.name)}
+            |Pushed Filters: ${MDC(PUSHED_FILTERS, pushedFiltersStr)}
+            |Post-Scan Filters: ${MDC(POST_SCAN_FILTERS, postScanFilters.mkString(","))}
+           """.stripMargin)
+
+        h
+    }
   }
 
   def pushDownAggregates(plan: LogicalPlan): LogicalPlan = plan.transform {

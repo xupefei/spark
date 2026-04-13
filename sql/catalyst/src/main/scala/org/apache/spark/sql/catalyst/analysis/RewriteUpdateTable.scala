@@ -17,12 +17,16 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, EqualNullSafe, Expression, If, Literal, MetadataAttribute, Not, SubqueryExpression}
+import scala.jdk.CollectionConverters._
+
+import org.apache.spark.sql.catalyst.expressions.{AggregateFilter, Alias, And, Attribute, AttributeReference, DynamicPruningExpression, EqualNullSafe, EqualTo, Expression, If, Literal, MetadataAttribute, Not, SubqueryExpression}
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
-import org.apache.spark.sql.catalyst.plans.logical.{Assignment, Expand, Filter, LogicalPlan, Project, ReplaceData, Union, UpdateTable, WriteDelta}
+import org.apache.spark.sql.catalyst.plans.logical.{Assignment, Expand, Filter, LogicalPlan, MapPartitionsInternal, Project, ReplaceData, Union, UpdateTable, WriteDelta}
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.RowDeltaUtils._
 import org.apache.spark.sql.connector.catalog.SupportsRowLevelOperations
-import org.apache.spark.sql.connector.write.{RowLevelOperationTable, SupportsDelta}
+import org.apache.spark.sql.connector.write.{RequiresAggregateFiltering, RowLevelOperationTable, SupportsDelta}
+import org.apache.spark.sql.connector.write.RequiresAggregateFiltering.FilterType.MATCHED
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command.UPDATE
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, ExtractV2Table}
 import org.apache.spark.sql.types.IntegerType
@@ -44,8 +48,12 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
           val table = buildOperationTable(tbl, UPDATE, CaseInsensitiveStringMap.empty())
           val updateCond = cond.getOrElse(TrueLiteral)
           table.operation match {
+            case _: SupportsDelta with RequiresAggregateFiltering =>
+              buildWriteDeltaPlanWithAggregateFiltering(r, table, assignments, updateCond)
             case _: SupportsDelta =>
               buildWriteDeltaPlan(r, table, assignments, updateCond)
+            case _: RequiresAggregateFiltering =>
+              buildReplaceDataPlanWithAggregateFiltering(r, table, assignments, updateCond)
             case _ if SubqueryExpression.hasSubquery(updateCond) =>
               buildReplaceDataWithUnionPlan(r, table, assignments, updateCond)
             case _ =>
@@ -55,6 +63,79 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
         case _ =>
           u
       }
+  }
+
+  private def buildWriteDeltaPlanWithAggregateFiltering(
+      relation: DataSourceV2Relation,
+      operationTable: RowLevelOperationTable,
+      assignments: Seq[Assignment],
+      cond: Expression): WriteDelta = {
+    val operation = operationTable.operation.asInstanceOf[SupportsDelta]
+
+    // resolve all needed attrs (e.g. row ID and any required metadata attrs)
+    val rowAttrs = relation.output
+    val rowIdAttrs = resolveRowIdAttrs(relation, operation)
+    val metadataAttrs = resolveRequiredMetadataAttrs(relation, operation)
+
+    // construct a read relation and include all required metadata columns
+    val readRelation = buildRelationWithAttrs(relation, operationTable, metadataAttrs, rowIdAttrs)
+
+    // find all matched rows
+    val aggFilterExpr = buildAggFilter(relation, operationTable, cond)
+    val matchedRowsCond = EqualTo(resolveAttrRef("__is_matched", readRelation), TrueLiteral)
+    val matchedRowsPlan = Filter(And(matchedRowsCond, aggFilterExpr), readRelation)
+
+    // build a plan for updated records that match the condition
+    val rowDeltaPlan = buildWriteDeltaUpdateProjection(matchedRowsPlan, assignments, rowIdAttrs)
+
+    // build a plan to write the row delta to the table
+    val writeRelation = relation.copy(table = operationTable)
+    val projections = buildWriteDeltaProjections(rowDeltaPlan, rowAttrs, rowIdAttrs, metadataAttrs)
+    WriteDelta(writeRelation, cond, rowDeltaPlan, relation, projections)
+  }
+
+  private def buildReplaceDataPlanWithAggregateFiltering(
+      relation: DataSourceV2Relation,
+      operationTable: RowLevelOperationTable,
+      assignments: Seq[Assignment],
+      cond: Expression): ReplaceData = {
+    // resolve all required metadata attrs that are needed for this operation
+    val metadataAttrs = resolveRequiredMetadataAttrs(relation, operationTable.operation)
+
+    // construct a read relation and include all required metadata columns
+    val readRelation = buildRelationWithAttrs(relation, operationTable, metadataAttrs)
+
+    // construct an aggregate filter and add it to the plan
+    val aggFilterExpr = buildAggFilter(relation, operationTable, cond)
+    val filteredReadRelation = Filter(aggFilterExpr, readRelation)
+
+    // update all matched rows, carry over unchanged rows
+    val updatedAndRemainingRowsPlan = buildReplaceDataUpdateProjection(
+      filteredReadRelation,
+      assignments,
+      EqualTo(resolveAttrRef("__is_matched", filteredReadRelation), TrueLiteral))
+
+    // build a plan to replace read groups in the table
+    val writeRelation = relation.copy(table = operationTable)
+    val query = addOperationColumn(WRITE_WITH_METADATA_OPERATION, updatedAndRemainingRowsPlan)
+    val projections = buildReplaceDataProjections(query, relation.output, metadataAttrs)
+    ReplaceData(writeRelation, cond, query, relation, projections)
+  }
+
+  private def buildAggFilter(
+      relation: DataSourceV2Relation,
+      operationTable: RowLevelOperationTable,
+      cond: Expression): DynamicPruningExpression = {
+    val operation = operationTable.operation.asInstanceOf[RequiresAggregateFiltering]
+    val filterDef = operation.getFilterDefinition(MATCHED)
+    val aggPlan = buildAggPlan(filterDef, Filter(cond, relation))
+    val pruningPlan = Option(filterDef.outputWriter).fold(aggPlan) { stateWriter =>
+      MapPartitionsInternal(
+        func = scalaIter => stateWriter.write(scalaIter.asJava).asScala,
+        output = DataTypeUtils.toAttributes(stateWriter.outputType),
+        aggPlan)
+    }
+    DynamicPruningExpression(AggregateFilter(pruningPlan))
   }
 
   // build a rewrite plan for sources that support replacing groups of data (e.g. files, partitions)

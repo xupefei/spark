@@ -99,3 +99,90 @@ DO NOT push to the upstream repo. Always push to the personal fork. Open PRs aga
 DO NOT force push or use `--amend` on pushed commits unless the user explicitly asks. If the remote branch has new commits, fetch and rebase before pushing.
 
 Always get user approval before external operations such as pushing commits, creating PRs, or posting comments. Use `gh pr create` to open PRs. If `gh` is not installed, generate the GitHub PR URL for the user and recommend installing the GitHub CLI.
+
+---
+
+## Code Style & Review Checklist
+
+- Names: meaningful yet concise.
+- Method length: avoid big chunky methods that do multiple things.
+- Line length: at most 100 chars.
+- Class/method/variable access: Pick the least open modifier that works.
+- Backward compatibility: New APIs don't break existing code, maintain compatibility with overloads.
+- Always estimate the number of times a method will be called. If it is expected to be called in a tight loop (thousands of times), pay extra attention to performance!
+- Method names
+  - Descriptive yet short verb-noun: buildReplaceDataPlan, extractInputType
+  - Conversion methods: Use to prefix → toInstruction, toGroupFilterCondition
+  - NO getXXX: Avoid getter prefixes for simple accessors (use property-style)
+  - Use `obj.property` over `obj.property()` in Scala while calling getters or simple methods without any mutation action. Even when calling Java objects from Scala.
+- Variable Naming
+  - Descriptive yet concise names: `groupFilterCond`, `matchedInstructions`
+  - Plural words for collections: `args`, `assignments`, `metadataAttrs`
+- Code Comments
+  - Use ScalaDoc or Javadoc for **public APIs** with parameter descriptions
+  - Use inline comments for private methods and code blocks that require explanation
+  - Document non-obvious design decisions, complex logic, edge cases, performance considerations
+- Import Organization (follow Databricks Scala Guide)
+  - Group imports: `java.*`/`javax.*` → `scala.*` → third-party (`org.*`, `com.*`) → project (`org.apache.spark.*`)
+  - Within each group: alphabetical order by **full package path**
+  - For `org.apache.spark.sql.*` imports: `catalyst` comes before `connector`
+  - Use absolute paths, separate groups with blank lines
+- If method/class args have to be split on multiple lines, **never** leave trailing `)` on a new line. Instead, put close parenthesis on the same line with the last arg like `argN)`.
+- **ALWAYS** try to find existing logical/physical plan nodes and/or expressions before creating new ones.
+
+---
+
+## Spark-Specific Knowledge
+
+### LogicalPlan
+
+- Base: `QueryPlan[LogicalPlan]`
+- Key traits: `AnalysisHelper`, `LogicalPlanStats`, `QueryPlanConstraints`, `Logging`
+- Node types: `LeafNode`, `UnaryNode`, `BinaryNode`
+- Essential properties: `output`, `resolved`, `isStreaming`, `maxRows`
+- Core methods: `resolveOperators[Up|Down|WithPruning]`, `resolveExpressions[...]`
+- Analysis skips already-analyzed subtrees for efficiency.
+
+### Analyzer
+
+- Located in `sql/catalyst/analysis/Analyzer.scala`.
+- Converts **unresolved** plans → **resolved** logical plans.
+- Organizes rules in **batches** (`fixedPoint` or `Once`) for resolution and cleanup.
+- Uses **TreePattern-based pruning**, **relation caching**, and **stateful two-pass rules** for performance.
+
+### Optimizer
+
+- Located in `sql/catalyst/optimizer/Optimizer.scala`.
+- Transforms **analyzed** plans → **optimized** plans using **rule-based fixed-point execution**.
+- Key optimizations: predicate/projection pushdown, join reordering, constant folding, operator elimination, subquery rewriting.
+
+### Physical Planning (`SparkPlan`)
+
+- Located in `sql/core/execution`.
+- Represents **executable** operations (`RDD[InternalRow]`), vs. LogicalPlan (semantic only).
+- Node types: `LeafExecNode`, `UnaryExecNode`, `BinaryExecNode`
+- Strategies map `LogicalPlan` → `SparkPlan` (e.g., `JoinSelection`, `Aggregation`, `SpecialLimits`).
+
+### Data Source V2 (DSv2)
+
+Everything under `org.apache.spark.sql.connector` is considered DSv2.
+
+Key interfaces:
+- `Table`, `SupportsRead`, `SupportsWrite`, `SupportsRowLevelOperations`
+- `RowLevelOperation` — logical representation of DELETE, UPDATE, or MERGE
+- `SupportsDelta` — mix-in for connectors that can handle row deltas
+- `RequiresAggregateFiltering` — mix-in for connectors that need aggregate pre-computation
+
+**DSv2 Relation Lifecycle**:
+
+```
+Table (analysis) → DataSourceV2Relation (logical) → DataSourceV2ScanRelation (scan planned) → BatchScanExec (physical)
+```
+
+### Development Tips
+
+- **Rule patterns:**
+    - Single-pass: `plan.resolveOperators { case ... => ... }`
+    - Two-pass: Collect state → Transform plan
+- **Performance:**
+    - Use pruning (`_.containsPattern`) and caches to skip redundant traversals.

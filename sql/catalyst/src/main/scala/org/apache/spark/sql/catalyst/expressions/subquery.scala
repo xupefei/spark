@@ -23,6 +23,7 @@ import org.apache.spark.sql.catalyst.analysis.UnresolvedPlanId
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.trees.LeafLike
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
@@ -639,5 +640,24 @@ case class UnresolvedExistsPlanId(planId: Long)
 
   override def withPlan(plan: LogicalPlan): Expression = {
     Exists(plan)
+  }
+}
+
+case class AggregateFilter(
+    plan: LogicalPlan,
+    exprId: ExprId = NamedExpression.newExprId)
+  extends PlanExpression[LogicalPlan] with Predicate with LeafLike[Expression] with Unevaluable {
+
+  final override def nodePatternsInternal(): Seq[TreePattern] = Seq(AGGREGATE_FILTER)
+
+  override def nullable: Boolean = false
+  override def dataType: DataType = BooleanType
+
+  def withNewPlan(plan: LogicalPlan): AggregateFilter = copy(plan = plan)
+
+  override def toString: String = s"aggregate-filter#${exprId.id}"
+
+  override lazy val canonicalized: AggregateFilter = {
+    copy(plan = plan.canonicalized, exprId = ExprId(0))
   }
 }

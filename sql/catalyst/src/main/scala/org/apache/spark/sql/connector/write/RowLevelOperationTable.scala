@@ -19,9 +19,10 @@ package org.apache.spark.sql.connector.write
 
 import java.util
 
-import org.apache.spark.sql.connector.catalog.{Column, SupportsRead, SupportsRowLevelOperations, SupportsWrite, Table, TableCapability}
+import org.apache.spark.sql.connector.catalog.{Column, MetadataColumn, SupportsMetadataColumns, SupportsRead, SupportsRowLevelOperations, SupportsWrite, Table, TableCapability}
 import org.apache.spark.sql.connector.catalog.constraints.Constraint
 import org.apache.spark.sql.connector.read.ScanBuilder
+import org.apache.spark.sql.connector.write.RequiresAggregateFiltering.{FilterDefinition, FilterType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 /**
@@ -34,7 +35,8 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
  */
 private[sql] case class RowLevelOperationTable(
     table: Table with SupportsRowLevelOperations,
-    operation: RowLevelOperation) extends Table with SupportsRead with SupportsWrite {
+    operation: RowLevelOperation) extends Table
+  with SupportsRead with SupportsWrite with SupportsMetadataColumns {
 
   override def name: String = table.name
   override def columns: Array[Column] = table.columns()
@@ -48,5 +50,15 @@ private[sql] case class RowLevelOperationTable(
 
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
     operation.newWriteBuilder(info)
+  }
+
+  override def metadataColumns: Array[MetadataColumn] = table match {
+    case delegate: SupportsMetadataColumns => delegate.metadataColumns
+    case _ => Array.empty
+  }
+
+  def getFilterDefinition(filterType: FilterType): FilterDefinition = {
+    val filterableOperation = operation.asInstanceOf[RequiresAggregateFiltering]
+    filterableOperation.getFilterDefinition(filterType)
   }
 }

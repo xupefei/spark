@@ -29,4 +29,9 @@ object RowDeltaUtils {
   final val WRITE_OPERATION: Int = 5
   final val WRITE_WITH_METADATA_OPERATION: Int = 6
   final val ORIGINAL_ROW_ID_VALUE_PREFIX: String = "__original_row_id_"
+  final val IS_MATCHED: String = "__is_matched"
+  final val IS_CHANGED: String = "__is_changed"
+  final val IS_CHANGED_BY_MATCHED_ACTION: String = "__is_changed_by_matched_action"
+  final val IS_CHANGED_BY_NOT_MATCHED_BY_SOURCE_ACTION: String =
+    "__is_changed_by_not_matched_by_source_action"
 }

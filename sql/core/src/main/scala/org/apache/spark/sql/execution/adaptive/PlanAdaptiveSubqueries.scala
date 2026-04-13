@@ -20,16 +20,17 @@ package org.apache.spark.sql.execution.adaptive
 import org.apache.spark.sql.catalyst.expressions
 import org.apache.spark.sql.catalyst.expressions.{CreateNamedStruct, DynamicPruningExpression, ListQuery, Literal}
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.catalyst.trees.TreePattern.{DYNAMIC_PRUNING_SUBQUERY, IN_SUBQUERY, SCALAR_SUBQUERY}
+import org.apache.spark.sql.catalyst.trees.TreePattern.{AGGREGATE_FILTER, DYNAMIC_PRUNING_SUBQUERY, IN_SUBQUERY, SCALAR_SUBQUERY}
 import org.apache.spark.sql.execution
-import org.apache.spark.sql.execution.{InSubqueryExec, SparkPlan, SubqueryAdaptiveBroadcastExec, SubqueryExec}
+import org.apache.spark.sql.execution.{AggregateFilterExec, InSubqueryExec, SparkPlan, SubqueryAdaptiveBroadcastExec, SubqueryExec}
 
 case class PlanAdaptiveSubqueries(
     subqueryMap: Map[Long, SparkPlan]) extends Rule[SparkPlan] {
 
   def apply(plan: SparkPlan): SparkPlan = {
     plan.transformAllExpressionsWithPruning(
-      _.containsAnyPattern(SCALAR_SUBQUERY, IN_SUBQUERY, DYNAMIC_PRUNING_SUBQUERY)) {
+      _.containsAnyPattern(SCALAR_SUBQUERY, IN_SUBQUERY, DYNAMIC_PRUNING_SUBQUERY,
+        AGGREGATE_FILTER)) {
       case expressions.ScalarSubquery(_, _, exprId, _, _, _, _) =>
         val subquery = SubqueryExec.createForScalarSubquery(
           s"subquery#${exprId.id}", subqueryMap(exprId.id))
@@ -52,6 +53,10 @@ case class PlanAdaptiveSubqueries(
         val subquery = SubqueryAdaptiveBroadcastExec(name, broadcastKeyIndices, onlyInBroadcast,
           buildPlan, buildKeys, subqueryMap(exprId.id))
         DynamicPruningExpression(InSubqueryExec(value, subquery, exprId))
+      case rf: expressions.AggregateFilter =>
+        AggregateFilterExec(
+          SubqueryExec(s"runtime-filter#${rf.exprId.id}", subqueryMap(rf.exprId.id)),
+          rf.exprId)
     }
   }
 }

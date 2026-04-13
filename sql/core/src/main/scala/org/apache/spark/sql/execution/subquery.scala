@@ -21,7 +21,8 @@ import org.apache.spark.QueryContext
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.catalyst.{expressions, InternalRow}
 import org.apache.spark.sql.catalyst.expressions.{CreateNamedStruct, Expression, ExprId, InSet, ListQuery, Literal, PlanExpression, Predicate, SupportQueryContext}
-import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
+import org.apache.spark.sql.catalyst.expressions.codegen._
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.{LeafLike, UnaryLike}
 import org.apache.spark.sql.catalyst.trees.TreePattern._
@@ -175,12 +176,53 @@ case class InSubqueryExec(
     copy(child = newChild)
 }
 
+case class AggregateFilterExec(
+    plan: BaseSubqueryExec,
+    exprId: ExprId,
+    @transient private var resultState: Array[InternalRow] = null)
+  extends ExecSubqueryExpression with Predicate with LeafLike[Expression] {
+
+  final override def nodePatternsInternal(): Seq[TreePattern] = Seq(AGGREGATE_FILTER_EXEC)
+
+  override def nullable: Boolean = false
+  override def toString: String = s"aggregate-filter#${exprId.id} ${plan.name}"
+
+  def withNewPlan(plan: BaseSubqueryExec): AggregateFilterExec = copy(plan = plan)
+
+  def updateResult(): Unit = {
+    resultState = plan.executeCollect()
+  }
+
+  def state: Array[InternalRow] = {
+    updateResult()
+    resultState
+  }
+
+  override def eval(input: InternalRow): Any = {
+    // always evaluates to true for dynamic pruning
+    // the actual filtering happens in connectors
+    true
+  }
+
+  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    ev.copy(code = code"", isNull = FalseLiteral, value = TrueLiteral)
+  }
+
+  override lazy val canonicalized: AggregateFilterExec = {
+    copy(
+      plan = plan.canonicalized.asInstanceOf[BaseSubqueryExec],
+      exprId = ExprId(0),
+      resultState = null)
+  }
+}
+
 /**
  * Plans subqueries that are present in the given [[SparkPlan]].
  */
 case class PlanSubqueries(sparkSession: SparkSession) extends Rule[SparkPlan] {
   def apply(plan: SparkPlan): SparkPlan = {
-    plan.transformAllExpressionsWithPruning(_.containsAnyPattern(SCALAR_SUBQUERY, IN_SUBQUERY)) {
+    plan.transformAllExpressionsWithPruning(
+      _.containsAnyPattern(SCALAR_SUBQUERY, IN_SUBQUERY, AGGREGATE_FILTER)) {
       case subquery: expressions.ScalarSubquery =>
         val executedPlan = QueryExecution.prepareExecutedPlan(sparkSession, subquery.plan)
         ScalarSubquery(
@@ -200,6 +242,11 @@ case class PlanSubqueries(sparkSession: SparkSession) extends Rule[SparkPlan] {
         val executedPlan = QueryExecution.prepareExecutedPlan(sparkSession, query)
         InSubqueryExec(expr, SubqueryExec(s"subquery#${exprId.id}", executedPlan),
           exprId, isDynamicPruning = false)
+      case rf: expressions.AggregateFilter =>
+        val executedPlan = QueryExecution.prepareExecutedPlan(sparkSession, rf.plan)
+        AggregateFilterExec(
+          SubqueryExec(s"runtime-filter#${rf.exprId.id}", executedPlan),
+          rf.exprId)
     }
   }
 }

@@ -379,6 +379,7 @@ abstract class Optimizer(catalogManager: CatalogManager)
       plan.transformWithPruning(_.containsPattern(PLAN_EXPRESSION), ruleId) {
         case wd: WriteDelta => wd
         case rd: ReplaceData => rd
+        case wmd: WriteMergeDelta => wmd
         case p => optimize(p)
       }
     }
@@ -452,6 +453,8 @@ abstract class Optimizer(catalogManager: CatalogManager)
           s
         }
         optimizeSubquery(newPlan)
+      case rf: AggregateFilter =>
+        rf.withNewPlan(Optimizer.this.execute(rf.plan))
       case s: SubqueryExpression =>
         optimizeSubquery(s)
     }

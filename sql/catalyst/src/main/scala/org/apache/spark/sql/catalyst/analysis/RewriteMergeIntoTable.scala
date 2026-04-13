@@ -17,20 +17,25 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import scala.jdk.CollectionConverters._
+
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, AttributeReference, Exists, Expression, IsNotNull, Literal, MetadataAttribute, MonotonicallyIncreasingID, OuterReference, PredicateHelper, SubqueryExpression}
+import org.apache.spark.sql.catalyst.expressions.{AggregateFilter, Alias, And, Attribute, AttributeReference, DynamicPruningExpression, EqualTo, Exists, Expression, IsNotNull, Literal, MetadataAttribute, MonotonicallyIncreasingID, Or, OuterReference, PredicateHelper, SubqueryExpression}
 import org.apache.spark.sql.catalyst.expressions.Literal.{FalseLiteral, TrueLiteral}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, JoinType, LeftAnti, LeftOuter, RightOuter}
-import org.apache.spark.sql.catalyst.plans.logical.{AppendData, DeleteAction, Filter, HintInfo, InsertAction, Join, JoinHint, LogicalPlan, MergeAction, MergeIntoTable, MergeRows, NO_BROADCAST_AND_REPLICATION, Project, ReplaceData, UpdateAction, WriteDelta}
+import org.apache.spark.sql.catalyst.plans.logical.{AppendData, DeleteAction, Filter, HintInfo, InsertAction, Join, JoinHint, LogicalPlan, MapPartitionsInternal, MergeAction, MergeIntoTable, MergeRows, NO_BROADCAST_AND_REPLICATION, Project, ReplaceData, Union, UpdateAction, WriteDelta, WriteMergeDelta}
 import org.apache.spark.sql.catalyst.plans.logical.MergeRows.{Copy, Delete, Discard, Insert, Instruction, Keep, ROW_ID, Split, Update}
-import org.apache.spark.sql.catalyst.util.RowDeltaUtils.{OPERATION_COLUMN, WRITE_OPERATION, WRITE_WITH_METADATA_OPERATION}
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.util.RowDeltaUtils._
 import org.apache.spark.sql.connector.catalog.SupportsRowLevelOperations
-import org.apache.spark.sql.connector.write.{RowLevelOperationTable, SupportsDelta}
+import org.apache.spark.sql.connector.write.{RequiresAggregateFiltering, RowLevelOperationTable, SupportsDelta}
+import org.apache.spark.sql.connector.write.RequiresAggregateFiltering.FilterDefinition
+import org.apache.spark.sql.connector.write.RequiresAggregateFiltering.FilterType.{MATCHED_BY_SOURCE, NOT_MATCHED_BY_SOURCE}
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command.MERGE
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, ExtractV2Table}
-import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.{BooleanType, IntegerType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 /**
@@ -127,6 +132,10 @@ object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper
           validateMergeIntoConditions(m)
           val table = buildOperationTable(tbl, MERGE, CaseInsensitiveStringMap.empty())
           table.operation match {
+            case _: SupportsDelta with RequiresAggregateFiltering =>
+              buildWriteDeltaPlanWithAggregateFiltering(
+                r, table, source, cond, matchedActions,
+                notMatchedActions, notMatchedBySourceActions)
             case _: SupportsDelta =>
               buildWriteDeltaPlan(
                 r, table, source, cond, matchedActions,
@@ -140,6 +149,162 @@ object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper
         case _ =>
           m
       }
+  }
+
+  private def buildWriteDeltaPlanWithAggregateFiltering(
+      relation: DataSourceV2Relation,
+      operationTable: RowLevelOperationTable,
+      source: LogicalPlan,
+      cond: Expression,
+      matchedActions: Seq[MergeAction],
+      notMatchedActions: Seq[MergeAction],
+      notMatchedBySourceActions: Seq[MergeAction]): WriteMergeDelta = {
+    val operation = operationTable.operation.asInstanceOf[SupportsDelta]
+
+    // resolve all needed attrs (e.g. row ID and any required metadata attrs)
+    val rowAttrs = relation.output
+    val rowIdAttrs = resolveRowIdAttrs(relation, operation)
+    val metadataAttrs = resolveRequiredMetadataAttrs(relation, operation)
+
+    // build aggregations used by connectors to populate the following metadata columns:
+    // `__is_matched` -> returns true if the row matches the ON condition
+    // `__is_changed` -> returns true if the row is actually changed by an action
+
+    // build matched rows aggregation
+    val matchedAgg = buildMatchedAgg(relation, operationTable, source, cond, matchedActions)
+
+    // build not matched by source aggregation, if needed
+    val notMatchedBySourceAgg = if (notMatchedBySourceActions.nonEmpty) {
+      Some(buildNotMatchedBySourceAgg(relation, operationTable, notMatchedBySourceActions))
+    } else {
+      None
+    }
+
+    // find updates and inserts from matched and not matched actions respectively
+    val newDataFromMatchedAndNotMatchedActionsPlan = buildNewDataFromMatchedAndNotMatchedActions(
+      relation, operationTable, source, cond, matchedActions, notMatchedActions,
+      metadataAttrs, rowIdAttrs)
+
+    // union with updates (ignore deletes) from not matched by source actions, if any
+    val notMatchedBySourceUpdateActions = findUpdates(notMatchedBySourceActions)
+    val newDataPlan = if (notMatchedBySourceUpdateActions.isEmpty) {
+      newDataFromMatchedAndNotMatchedActionsPlan
+    } else {
+      val newDataFromNotMatchedBySourceActionsPlan = buildNewDataFromNotMatchedBySourceActions(
+        relation, operationTable, notMatchedBySourceUpdateActions,
+        metadataAttrs, rowIdAttrs)
+      Union(newDataFromMatchedAndNotMatchedActionsPlan, newDataFromNotMatchedBySourceActionsPlan)
+    }
+
+    // build a plan to write new data to the table
+    // connectors have all necessary information about deleted/updated rows via aggregations
+    val writeRelation = relation.copy(table = operationTable)
+    val projections = buildWriteDeltaProjections(newDataPlan, rowAttrs, rowIdAttrs, metadataAttrs)
+    WriteMergeDelta(
+      writeRelation, cond, newDataPlan, relation, projections,
+      matchedAgg, notMatchedBySourceAgg)
+  }
+
+  private def buildNewDataFromMatchedAndNotMatchedActions(
+      relation: DataSourceV2Relation,
+      operationTable: RowLevelOperationTable,
+      source: LogicalPlan,
+      cond: Expression,
+      matchedActions: Seq[MergeAction],
+      notMatchedActions: Seq[MergeAction],
+      metadataAttrs: Seq[AttributeReference],
+      rowIdAttrs: Seq[AttributeReference]): MergeRows = {
+    val isMatchedAttr = resolveAttrRef(IS_MATCHED, relation)
+    val readMetadataAttrs = metadataAttrs :+ isMatchedAttr
+    val readRelation = buildRelationWithAttrs(
+      relation, operationTable,
+      readMetadataAttrs, rowIdAttrs)
+    val matchedRowsCond = EqualTo(isMatchedAttr, TrueLiteral)
+    val matchedRowsPlan = Filter(matchedRowsCond, readRelation)
+    val joinType = chooseWriteDeltaJoinType(notMatchedActions, Nil)
+    val checkCardinality = shouldCheckCardinality(matchedActions)
+    val joinPlan = join(matchedRowsPlan, source, joinType, cond, checkCardinality)
+    val matchedUpdateActions = findUpdates(matchedActions)
+    buildWriteDeltaMergeRowsPlan(
+      readRelation, joinPlan, matchedUpdateActions, notMatchedActions,
+      notMatchedBySourceActions = Nil, rowIdAttrs, checkCardinality, splitUpdates = false)
+  }
+
+  private def buildNewDataFromNotMatchedBySourceActions(
+      relation: DataSourceV2Relation,
+      operationTable: RowLevelOperationTable,
+      notMatchedBySourceUpdateActions: Seq[MergeAction],
+      metadataAttrs: Seq[AttributeReference],
+      rowIdAttrs: Seq[AttributeReference]): MergeRows = {
+    val isMatchedAttr = resolveAttrRef(IS_MATCHED, relation)
+    val isChangedAttr = resolveAttrRef(IS_CHANGED, relation)
+    val readMetadataAttrs = metadataAttrs :+ isMatchedAttr :+ isChangedAttr
+    val readRelation =
+      buildRelationWithAttrs(relation, operationTable,
+      readMetadataAttrs, rowIdAttrs)
+    val readCond = And(
+      EqualTo(isMatchedAttr, FalseLiteral),
+      EqualTo(isChangedAttr, TrueLiteral))
+    val filteredReadRelation = Filter(readCond, readRelation)
+    val rowFromSource = Alias(Literal(null, BooleanType), ROW_FROM_SOURCE)()
+    val rowFromTarget = Alias(TrueLiteral, ROW_FROM_TARGET)()
+    val projExprs = filteredReadRelation.output :+ rowFromSource :+ rowFromTarget
+    val proj = Project(projExprs, filteredReadRelation)
+    buildWriteDeltaMergeRowsPlan(
+      readRelation, proj, matchedActions = Nil, notMatchedActions = Nil,
+      notMatchedBySourceUpdateActions, rowIdAttrs, checkCardinality = false, splitUpdates = false)
+  }
+
+  private def findUpdates(actions: Seq[MergeAction]): Seq[UpdateAction] = {
+    actions.collect { case u: UpdateAction => u }
+  }
+
+  private def buildMatchedAgg(
+      relation: DataSourceV2Relation,
+      operationTable: RowLevelOperationTable,
+      source: LogicalPlan,
+      cond: Expression,
+      matchedActions: Seq[MergeAction]): DynamicPruningExpression = {
+    val matchedRowsPlan = Join(relation, source, Inner, Some(cond), JoinHint.NONE)
+    val filterDef = operationTable.getFilterDefinition(MATCHED_BY_SOURCE)
+    buildAggFilter(matchedRowsPlan, matchedActions, filterDef, IS_CHANGED_BY_MATCHED_ACTION)
+  }
+
+  private def buildNotMatchedBySourceAgg(
+      relation: DataSourceV2Relation,
+      operationTable: RowLevelOperationTable,
+      notMatchedBySourceActions: Seq[MergeAction]): DynamicPruningExpression = {
+    val readRelation = relation.copy(table = operationTable)
+    val filterDef = operationTable.getFilterDefinition(NOT_MATCHED_BY_SOURCE)
+    buildAggFilter(
+      readRelation, notMatchedBySourceActions,
+      filterDef, IS_CHANGED_BY_NOT_MATCHED_BY_SOURCE_ACTION)
+  }
+
+  private def buildAggFilter(
+      child: LogicalPlan,
+      actions: Seq[MergeAction],
+      filterDef: FilterDefinition,
+      isModifiedColName: String): DynamicPruningExpression = {
+    val isChangedCond = combineActionConditions(actions)
+    val isChangedColumn = Alias(isChangedCond, isModifiedColName)()
+    val project = Project(child.output :+ isChangedColumn, child)
+    val aggPlan = buildAggPlan(filterDef, project)
+    val pruningPlan = Option(filterDef.outputWriter).fold(aggPlan) { writer =>
+      MapPartitionsInternal(
+        func = scalaIter => writer.write(scalaIter.asJava).asScala,
+        output = DataTypeUtils.toAttributes(writer.outputType),
+        aggPlan)
+    }
+    DynamicPruningExpression(AggregateFilter(pruningPlan))
+  }
+
+  private def combineActionConditions(actions: Seq[MergeAction]): Expression = {
+    if (actions.exists(_.condition.isEmpty)) {
+      TrueLiteral
+    } else {
+      actions.flatMap(_.condition).reduce(Or)
+    }
   }
 
   // build a rewrite plan for sources that support replacing groups of data (e.g. files, partitions)

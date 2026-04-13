@@ -22,13 +22,15 @@ import scala.collection.mutable
 import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.ProjectingInternalRow
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, AttributeSet, Expression, ExprId, Literal, MetadataAttribute, NamedExpression, V2ExpressionUtils}
-import org.apache.spark.sql.catalyst.plans.logical.{Assignment, Expand, LogicalPlan, MergeRows, Project}
+import org.apache.spark.sql.catalyst.expressions.aggregate.V2Aggregator
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Assignment, Expand, LogicalPlan, MergeRows, Project, Union}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.util.{ReplaceDataProjections, WriteDeltaProjections}
 import org.apache.spark.sql.catalyst.util.RowDeltaUtils._
 import org.apache.spark.sql.connector.catalog.SupportsRowLevelOperations
-import org.apache.spark.sql.connector.expressions.FieldReference
+import org.apache.spark.sql.connector.expressions.{FieldReference, NamedReference}
 import org.apache.spark.sql.connector.write.{RowLevelOperation, RowLevelOperationInfoImpl, RowLevelOperationTable, SupportsDelta}
+import org.apache.spark.sql.connector.write.RequiresAggregateFiltering.FilterDefinition
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
@@ -104,7 +106,21 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
   }
 
   protected def resolveAttrRef(name: String, plan: LogicalPlan): AttributeReference = {
-    V2ExpressionUtils.resolveRef[AttributeReference](FieldReference(name), plan)
+    resolveAttrRef(FieldReference(name), plan)
+  }
+
+  protected def resolveAttrRef(ref: NamedReference, plan: LogicalPlan): AttributeReference = {
+    V2ExpressionUtils.resolveRef[AttributeReference](ref, plan)
+  }
+
+  protected def resolveAttrRefs(
+      refs: Array[NamedReference],
+      plan: LogicalPlan): Seq[AttributeReference] = {
+    refs.map(resolveAttrRef(_, plan)).toImmutableArraySeq
+  }
+
+  private def toAttrs(refs: Array[NamedReference]): Seq[UnresolvedAttribute] = {
+    refs.map(ref => UnresolvedAttribute(ref.fieldNames.toImmutableArraySeq)).toImmutableArraySeq
   }
 
   protected def deltaDeleteOutput(
@@ -236,6 +252,7 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
       case p: Project => Seq(p.projectList)
       case e: Expand => e.projections
       case m: MergeRows => m.outputs
+      case u: Union => extractOutputs(u.children(0)) ++ extractOutputs(u.children(1))
       case _ => throw SparkException.internalError("Can't extract outputs from plan: " + plan)
     }
   }
@@ -316,5 +333,15 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
     attrs.zipWithIndex.map { case (attr, index) =>
       AttributeReference(attr.name, attr.dataType, nullabilityMap(index), attr.metadata)()
     }
+  }
+
+  protected def buildAggPlan(filterDef: FilterDefinition, child: LogicalPlan): LogicalPlan = {
+    val groupingExprs = toAttrs(filterDef.groupingKey)
+    val inputExprs = toAttrs(filterDef.inputAttributes)
+    val aggExpr = V2Aggregator(
+      filterDef.aggregateFunction,
+      inputExprs).toAggregateExpression(isDistinct = false)
+    val namedAggExpr = Alias(aggExpr, "__agg_result")()
+    Aggregate(groupingExprs, groupingExprs :+ namedAggExpr, child)
   }
 }

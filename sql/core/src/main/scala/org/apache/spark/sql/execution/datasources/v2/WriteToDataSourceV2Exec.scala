@@ -24,16 +24,19 @@ import org.apache.spark.internal.{Logging, LogKeys}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.{InternalRow, ProjectingInternalRow}
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, DynamicPruningExpression, Expression, Literal}
 import org.apache.spark.sql.catalyst.plans.logical.{AppendData, LogicalPlan, OverwriteByExpression, TableSpec, UnaryNode}
 import org.apache.spark.sql.catalyst.util.{removeInternalMetadata, CharVarcharUtils, ReplaceDataProjections, WriteDeltaProjections}
 import org.apache.spark.sql.catalyst.util.RowDeltaUtils.{DELETE_OPERATION, INSERT_OPERATION, REINSERT_OPERATION, UPDATE_OPERATION, WRITE_OPERATION, WRITE_WITH_METADATA_OPERATION}
 import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column, Identifier, StagedTable, StagingTableCatalog, Table, TableCatalog, TableInfo, TableWritePrivilege}
 import org.apache.spark.sql.connector.expressions.Transform
+import org.apache.spark.sql.connector.expressions.filter.AggregatePredicate
 import org.apache.spark.sql.connector.metric.CustomMetric
+import org.apache.spark.sql.connector.read.SupportsRuntimeV2Filtering
+import org.apache.spark.sql.connector.write.RowLevelOperationTable
 import org.apache.spark.sql.connector.write.{BatchWrite, DataWriter, DataWriterFactory, DeltaWrite, DeltaWriter, MergeSummaryImpl, PhysicalWriteInfoImpl, Write, WriterCommitMessage, WriteSummary}
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
-import org.apache.spark.sql.execution.{QueryExecution, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{AggregateFilterExec, QueryExecution, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.metric.{CustomMetrics, SQLMetric, SQLMetrics}
 import org.apache.spark.sql.types.StructType
@@ -352,6 +355,88 @@ case class WriteDeltaExec(
   }
 
   override protected def withNewChildInternal(newChild: SparkPlan): WriteDeltaExec = {
+    copy(query = newChild)
+  }
+}
+
+/**
+ * Physical plan node for MERGE operations with aggregate filtering support.
+ */
+case class WriteMergeDeltaExec(
+    query: SparkPlan,
+    refreshCache: () => Unit,
+    projections: WriteDeltaProjections,
+    matchedRowsAgg: Expression,
+    notMatchedBySourceAgg: Option[Expression],
+    write: DeltaWrite) extends V2ExistingTableWriteExec with AdaptiveSparkPlanHelper {
+
+  override lazy val writingTask: WritingSparkTask[_] = {
+    if (projections.metadataProjection.isDefined) {
+      DeltaWithMetadataWritingSparkTask(projections)
+    } else {
+      DeltaWritingSparkTask(projections)
+    }
+  }
+
+  override protected def run(): Seq[InternalRow] = {
+    // execute matched rows aggregation to get the predicate
+    val matchedPredicate = executeAggregateFilter(matchedRowsAgg)
+
+    // execute not matched by source aggregation, if present
+    val notMatchedBySourcePredicate = notMatchedBySourceAgg.map {
+      case e @ DynamicPruningExpression(aggExpr: AggregateFilterExec) =>
+        // find the row-level operation scan in the aggregate filter plan and push matched predicate
+        aggExpr.plan.foreach {
+          case scan: BatchScanExec if isRowLevelOperationScan(scan) =>
+            pushPredicate(scan, matchedPredicate)
+          case _ =>
+            // skip
+        }
+        executeAggregateFilter(e)
+      case other =>
+        throw new RuntimeException(s"Unexpected runtime filter: $other")
+    }
+
+    // push both predicates into the main query
+    stripAQEPlan(query).foreach {
+      case scan: BatchScanExec if isRowLevelOperationScan(scan) =>
+        pushPredicate(scan, matchedPredicate)
+        notMatchedBySourcePredicate.foreach { predicate => pushPredicate(scan, predicate) }
+      case _ =>
+        // skip
+    }
+
+    // execute the main query with pushed predicates
+    val writtenRows = try {
+      writeWithV2(write.toBatch)
+    } finally {
+      postDriverMetrics()
+    }
+    refreshCache()
+    writtenRows
+  }
+
+  private def isRowLevelOperationScan(scan: BatchScanExec): Boolean = {
+    scan.table match {
+      case _: RowLevelOperationTable => true
+      case _ => false
+    }
+  }
+
+  private def pushPredicate(
+      scanExec: BatchScanExec,
+      predicate: AggregatePredicate): Unit = {
+    scanExec.scan.asInstanceOf[SupportsRuntimeV2Filtering].filter(Array(predicate))
+  }
+
+  private def executeAggregateFilter(expr: Expression): AggregatePredicate = expr match {
+    case DynamicPruningExpression(agg: AggregateFilterExec) =>
+      new AggregatePredicate(agg.state, agg.plan.schema)
+    case other =>
+      throw new RuntimeException(s"Unexpected runtime filter: $other")
+  }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): WriteMergeDeltaExec = {
     copy(query = newChild)
   }
 }

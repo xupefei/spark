@@ -21,7 +21,7 @@ import scala.collection.mutable
 
 import org.apache.spark.internal.LogKeys.{CONFIG, SUB_QUERY}
 import org.apache.spark.sql.catalyst.expressions
-import org.apache.spark.sql.catalyst.expressions.{DynamicPruningSubquery, ListQuery, SubqueryExpression}
+import org.apache.spark.sql.catalyst.expressions.{AggregateFilter, DynamicPruningSubquery, ListQuery, SubqueryExpression}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.plans.physical.UnspecifiedDistribution
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -139,7 +139,8 @@ case class InsertAdaptiveSparkPlan(
    */
   private def buildSubqueryMap(plan: SparkPlan): Map[Long, SparkPlan] = {
     val subqueryMap = mutable.HashMap.empty[Long, SparkPlan]
-    if (!plan.containsAnyPattern(SCALAR_SUBQUERY, IN_SUBQUERY, DYNAMIC_PRUNING_SUBQUERY)) {
+    if (!plan.containsAnyPattern(SCALAR_SUBQUERY, IN_SUBQUERY, DYNAMIC_PRUNING_SUBQUERY,
+        AGGREGATE_FILTER)) {
       return subqueryMap.toMap
     }
     plan.foreach(_.expressions.filter(_.containsPattern(PLAN_EXPRESSION)).foreach(_.foreach {
@@ -149,6 +150,12 @@ case class InsertAdaptiveSparkPlan(
           val executedPlan = compileSubquery(subquery.plan)
           verifyAdaptivePlan(executedPlan, subquery.plan)
           subqueryMap.put(subquery.exprId.id, executedPlan)
+        }
+      case rf: AggregateFilter =>
+        if (!subqueryMap.contains(rf.exprId.id)) {
+          val executedPlan = compileSubquery(rf.plan)
+          verifyAdaptivePlan(executedPlan, rf.plan)
+          subqueryMap.put(rf.exprId.id, executedPlan)
         }
       case _ =>
     }))

@@ -26,6 +26,7 @@ object TreePattern extends Enumeration  {
   // Enum Ids start from 0.
   // Expression patterns (alphabetically ordered)
   val AGGREGATE_EXPRESSION = Value(0)
+  val AGGREGATE_FILTER: Value = Value
   val ALIAS: Value = Value
   val ANALYSIS_AWARE_EXPRESSION: Value = Value
   val AND: Value = Value
@@ -122,6 +123,7 @@ object TreePattern extends Enumeration  {
   val UNRESOLVED_WINDOW_EXPRESSION: Value = Value
 
   // Execution expression patterns (alphabetically ordered)
+  val AGGREGATE_FILTER_EXEC: Value = Value
   val IN_SUBQUERY_EXEC: Value = Value
 
   // Boundary between Expression patterns and Operator patterns.
